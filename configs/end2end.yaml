@@ -25,6 +25,8 @@ end2end_eval:
     prediction:
       data_path: ./demo_data/end2end
     match_method: quick_match
+    # Strip runaway repeated tails from predictions before matching.
+    truncated_repeats: false
     # Keep each stage around 1/3 to 1/2 of idle CPUs to avoid deadlocks.
     match_workers: 13
     quick_match_truncated_timeout_sec: 300

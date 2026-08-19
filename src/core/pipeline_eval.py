@@ -108,6 +108,12 @@ class End2EndEval():
         if match_debug_info:
             result_all['match_debug'] = match_debug_info
 
+        # Include repeat statistics (plain dict on dataset.samples) so that
+        # generate_result_tables.py can read them from the metric result JSON.
+        repeat_stats = getattr(dataset, 'samples', {}).get('repeat_stats')
+        if repeat_stats is not None:
+            result_all['repeat_stats'] = repeat_stats
+
         with open(f'./result/{save_name}_metric_result.json', 'w', encoding='utf-8') as f:
             json.dump(result_all, f, indent=4, ensure_ascii=False)
 

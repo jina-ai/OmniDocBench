@@ -41,6 +41,83 @@ from loguru import logger
 import sys
 import traceback
 
+
+# refer to: https://github.com/opendatalab/OmniDocBench/issues/195
+def clean_truncated_repeats(
+    text: str,
+    min_text_len: int = 8000,
+    max_period: int = 200,
+    min_period: int = 1,
+    min_repeat_chars: int = 100,
+    min_repeat_times: int = 5,
+) -> str:
+    n = len(text)
+    if n < min_text_len:
+        return text
+
+    min_period = max(1, min_period)
+    min_repeat_times = max(1, min_repeat_times)
+    max_period = min(max_period, n - 1)
+    for unit_len in range(min_period, max_period + 1):
+        if text[n - 1] != text[n - 1 - unit_len]:
+            continue
+        match_len = 1
+        idx = n - 2
+        while idx >= unit_len and text[idx] == text[idx - unit_len]:
+            match_len += 1
+            idx -= 1
+        total_len = match_len + unit_len
+        repeat_times = total_len // unit_len
+        tail_len = total_len % unit_len
+        if repeat_times >= min_repeat_times and total_len >= min_repeat_chars:
+            return text[:n - total_len + unit_len] + text[n - tail_len:]
+    return text
+
+
+def detect_repeated_substring(s: str, min_repeats: int = 10, min_length: int = 2) -> bool:
+    """Detect whether the end of `s` is composed of a substring repeated
+    consecutively at least `min_repeats` times.
+
+    Returns True if such a repeating substring is found, otherwise False.
+    """
+    n = len(s)
+    min_length = max(1, min_length)
+    min_repeats = max(1, min_repeats)
+
+    if n < min_length * min_repeats:
+        return False
+
+    max_length = n // min_repeats
+
+    for unit_len in range(min_length, max_length + 1):
+        if s[n - 1] != s[n - 1 - unit_len]:
+            continue
+        match_len = 1
+        idx = n - 2
+        while idx >= unit_len and s[idx] == s[idx - unit_len]:
+            match_len += 1
+            idx -= 1
+
+        total_len = match_len + unit_len
+        if total_len // unit_len >= min_repeats:
+            return True
+
+    return False
+
+
+def compute_repeat_ratio(text: str, min_repeats: int = 10, min_length: int = 2) -> float:
+    """
+    Per-document indicator: 1.0 if this document has repeated content at the end
+    (bad generation: model repeating tokens/phrases without ending), else 0.0.
+
+    Document-level repeat ratio = (number of documents with repeated tokens at the end)
+    / (total documents). That is reported as repeat_page_fraction in repeat_stats.
+    """
+    if not text or not text.strip():
+        return 0.0
+    return 1.0 if detect_repeated_substring(text, min_repeats=min_repeats, min_length=min_length) else 0.0
+
+
 @DATASET_REGISTRY.register("end2end_dataset")
 class End2EndDataset():
     def __init__(self, cfg_task):
@@ -56,6 +133,7 @@ class End2EndDataset():
         self.timeout_fallback_max_chunk_span = cfg_task['dataset'].get('timeout_fallback_max_chunk_span', cfg_task['dataset'].get('linear_fallback_max_merge_span', 10))
         self.timeout_fallback_order_window = cfg_task['dataset'].get('timeout_fallback_order_window')
         self.timeout_fallback_order_penalty = cfg_task['dataset'].get('timeout_fallback_order_penalty', 0.10)
+        self.truncated_repeats = cfg_task['dataset'].get('truncated_repeats', False)
         self.match_workers = resolve_match_workers(cfg_task.get('dataset'))
         self.slow_stage_log_sec = self._resolve_float_value(
             cfg_task['dataset'].get('slow_stage_log_sec', os.getenv('OMNIDOCBENCH_SLOW_STAGE_LOG_SEC', 60)),
@@ -2027,6 +2105,20 @@ class End2EndDataset():
             pred_content = read_md_file(pred_path) if pred_path else ""
             self._log_slow_stage(img_name, 'read_prediction', read_start)
 
+            # Compute repeat ratio on raw content before any cleaning, so we count docs
+            # that actually had repeated content at the end
+            page_repeat_ratio = compute_repeat_ratio(pred_content)
+
+            if self.truncated_repeats:
+                before = len(pred_content)
+                pred_content = clean_truncated_repeats(pred_content)
+                after = len(pred_content)
+                if after < before:
+                    logger.info(
+                        "Cleaned truncated repeats: page={}, chars_before={}, chars_after={}, removed={}",
+                        img_name, before, after, before - after,
+                    )
+
             process_start = time.monotonic()
             result = self.process_get_matched_elements(sample, pred_content, img_name)
             self._log_slow_stage(img_name, 'process_page', process_start)
@@ -2037,6 +2129,8 @@ class End2EndDataset():
             'img_name': img_name,
             'pred_path': pred_path,
             'result': result,
+            'repeat_ratio': page_repeat_ratio,
+            'page_attribute': sample.get('page_info', {}).get('page_attribute', {}) or {},
         }
 
     def _collect_page_matches(self, gt_samples, pred_folder):
@@ -2078,12 +2172,39 @@ class End2EndDataset():
         html_table_match = []
         latex_table_match = []
         order_match = []
+        # Repeat statistics aggregators
+        repeat_page_count = 0
+        total_pages = 0
+        sum_page_repeat_ratio = 0.0
+        repeat_by_data_source = defaultdict(lambda: {'count': 0, 'sum_ratio': 0.0, 'repeat_pages': 0})
+        repeat_by_language = defaultdict(lambda: {'count': 0, 'sum_ratio': 0.0, 'repeat_pages': 0})
         for page_result in self._collect_page_matches(gt_samples, pred_folder):
             plain_text_match_clean, formated_display_formula, latex_table_match_s, html_table_match_s, order_match_single = page_result['result']
+
+            page_repeat_ratio = page_result.get('repeat_ratio', 0.0)
+            total_pages += 1
+            sum_page_repeat_ratio += page_repeat_ratio
+            if page_repeat_ratio > 0:
+                repeat_page_count += 1
+
+            # collect data_source and language from sample page_info
+            page_attr = page_result.get('page_attribute', {})
+            data_source = page_attr.get('data_source', 'unknown')
+            language = page_attr.get('language', 'unknown')
+
+            for stats in (repeat_by_data_source[data_source], repeat_by_language[language]):
+                stats['count'] += 1
+                stats['sum_ratio'] += page_repeat_ratio
+                if page_repeat_ratio > 0:
+                    stats['repeat_pages'] += 1
 
             if order_match_single:
                 order_match.append(order_match_single)
             if plain_text_match_clean:
+                # attach page-level repeat_ratio to each matched plain text item
+                # (raw page had repeats at end or not)
+                for itm in plain_text_match_clean:
+                    itm['repeat_ratio'] = page_repeat_ratio
                 plain_text_match.extend(plain_text_match_clean)
             if formated_display_formula:
                 display_formula_match.extend(formated_display_formula)
@@ -2091,6 +2212,17 @@ class End2EndDataset():
                 latex_table_match.extend(latex_table_match_s)
             if html_table_match_s:
                 html_table_match.extend(html_table_match_s)
+
+        # After processing all samples, compute aggregate repeat statistics
+        repeat_stats = {
+            'overall': {
+                'avg_repeat_ratio': (sum_page_repeat_ratio / total_pages) if total_pages > 0 else 0.0,
+                'repeat_page_fraction': (repeat_page_count / total_pages) if total_pages > 0 else 0.0,
+                'pages': total_pages,
+            },
+            'by_data_source': self._summarize_repeat_groups(repeat_by_data_source),
+            'by_language': self._summarize_repeat_groups(repeat_by_language),
+        }
 
         display_formula_match_clean, display_formula_match_others = [], []
         for item in display_formula_match:
@@ -2116,11 +2248,24 @@ class End2EndDataset():
             'text_block': DATASET_REGISTRY.get('recogition_end2end_base_dataset')(plain_text_match),
             'display_formula':  DATASET_REGISTRY.get('recogition_end2end_base_dataset')(display_formula_match), 
             'table': DATASET_REGISTRY.get('recogition_end2end_table_dataset')(table_match, table_format),
-            'reading_order': DATASET_REGISTRY.get('recogition_end2end_base_dataset')(order_match)
+            'reading_order': DATASET_REGISTRY.get('recogition_end2end_base_dataset')(order_match),
+            'repeat_stats': repeat_stats
         }
       
 
         return matched_samples_all
+
+    @staticmethod
+    def _summarize_repeat_groups(grouped_stats):
+        summary = {}
+        for group_name, vals in grouped_stats.items():
+            cnt = vals['count']
+            summary[group_name] = {
+                'avg_repeat_ratio': (vals['sum_ratio'] / cnt) if cnt else 0.0,
+                'repeat_page_fraction': (vals['repeat_pages'] / cnt) if cnt else 0.0,
+                'pages': cnt
+            }
+        return summary
     
     #0403 提取gt的table跟pred的table进行匹配 -> 未匹配上的pred_table 去掉html格式然后丢进去混合匹配
     def process_get_matched_elements(self, sample, pred_content, img_name):
